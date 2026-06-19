@@ -1,4 +1,4 @@
-# cheetah 🐆
+# cheetah-curve 🐆
 
 Port of [Nockchain](https://nockchain.org)'s cryptographic primitives stripped of the nockvm / noun-serde deps:
 
