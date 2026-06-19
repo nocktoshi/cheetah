@@ -1,4 +1,4 @@
-//! # cheetah
+//! # cheetah-curve 🐆
 //!
 //! Pure-Rust implementation of Nockchain's cryptographic primitives:
 //!
@@ -22,11 +22,6 @@
 //! result is identical, guarded by the `test_f6inv` known-answer test. Byte-exact
 //! parity with the on-chain Nockchain verifier and `@nockchain/rose-ts` is
 //! enforced by the in-crate known-answer + golden-vector tests.
-
-// Vendored verbatim: keep the full primitive API (callers may use any of it) and
-// don't hold third-party code to a host project's style lints.
-#![allow(dead_code)]
-#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 
 #[macro_use]
 pub mod belt;
