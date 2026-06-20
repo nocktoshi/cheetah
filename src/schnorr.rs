@@ -20,17 +20,16 @@
 //! Security note: the entire signing path is constant time.
 //! See `SECURITY.md`.
 
-use crypto_bigint::{MulMod, NonZero, U256};
+use crypto_bigint::U256;
 use subtle::{Choice, ConstantTimeEq, ConstantTimeLess};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::belt::Belt;
 use crate::cheetah::{
     ch_add, ch_neg, ch_scal_big, trunc_g_order, CheetahError, CheetahPoint, A_GEN, A_ID, G_ORDER,
+    G_ORDER_NZ,
 };
 use crate::tip5::hash::hash_varlen;
-
-const G_ORDER_NZ: NonZero<U256> = NonZero::<U256>::new_unwrap(G_ORDER);
 
 /// Constant-time check that `x ∈ [1, G_ORDER)`
 /// - the valid range for a private key, challenge, or response scalar.
@@ -55,8 +54,8 @@ impl Signature {
     /// 64-byte wire form: `c` (32 LE bytes) followed by `s` (32 LE bytes).
     pub fn to_le_bytes(&self) -> [u8; 64] {
         let mut o = [0u8; 64];
-        o[..32].copy_from_slice(&self.c.to_le_bytes());
-        o[32..].copy_from_slice(&self.s.to_le_bytes());
+        o[..32].copy_from_slice(self.c.to_le_bytes().as_ref());
+        o[32..].copy_from_slice(self.s.to_le_bytes().as_ref());
         o
     }
 
@@ -156,7 +155,7 @@ impl PrivateKey {
 
     /// 32-byte little-endian scalar encoding.
     pub fn to_le_bytes(&self) -> [u8; 32] {
-        self.0.to_le_bytes()
+        self.0.to_le_bytes().into()
     }
 
     /// `P = x·G`.
@@ -169,7 +168,7 @@ impl PrivateKey {
     /// secret's 32 little-endian bytes are split into eight little-endian 32-bit
     /// limbs. `pubkey` is `P = x·G`.
     pub fn nonce_for(&self, pubkey: &CheetahPoint, message: &[u64; 5]) -> U256 {
-        let le = self.0.to_le_bytes();
+        let le: [u8; 32] = self.0.to_le_bytes().into();
         let mut limbs = [0u64; 8];
         for (i, limb) in limbs.iter_mut().enumerate() {
             let mut v = 0u64;
@@ -193,8 +192,8 @@ impl PrivateKey {
         let nonce = self.nonce_for(&pubkey, message);
         let r = ch_scal_big(&nonce, &A_GEN)?;
         let c = challenge(&r, &pubkey, message);
-        let cs = MulMod::mul_mod(&c, &self.0, &G_ORDER);
-        let s = nonce.add_mod(&cs, &G_ORDER);
+        let cs = c.mul_mod(&self.0, &G_ORDER_NZ);
+        let s = nonce.add_mod(&cs, &G_ORDER_NZ);
         Ok(Signature { c, s })
     }
 
@@ -202,7 +201,7 @@ impl PrivateKey {
     /// child public key is [`PublicKey::derive_child`] with the same `tweak`, so
     /// `self.derive_child(t).public_key() == self.public_key().derive_child(t)`.
     pub fn derive_child(&self, tweak: &U256) -> Self {
-        PrivateKey(self.0.add_mod(&reduce(tweak), &G_ORDER))
+        PrivateKey(self.0.add_mod(&reduce(tweak), &G_ORDER_NZ))
     }
 }
 
@@ -304,8 +303,8 @@ pub fn partial_sign(
     message: &[u64; 5],
 ) -> (U256, U256) {
     let c = challenge(aggregate_r, aggregate_pubkey, message);
-    let cs = MulMod::mul_mod(&c, secret_share, &G_ORDER);
-    let s_i = nonce_share.add_mod(&cs, &G_ORDER);
+    let cs = c.mul_mod(secret_share, &G_ORDER_NZ);
+    let s_i = nonce_share.add_mod(&cs, &G_ORDER_NZ);
     (c, s_i)
 }
 
@@ -313,7 +312,7 @@ pub fn partial_sign(
 pub fn aggregate_responses(c: U256, partials: &[U256]) -> Signature {
     let mut s = U256::ZERO;
     for p in partials {
-        s = s.add_mod(p, &G_ORDER);
+        s = s.add_mod(p, &G_ORDER_NZ);
     }
     Signature { c, s }
 }
@@ -321,7 +320,7 @@ pub fn aggregate_responses(c: U256, partials: &[U256]) -> Signature {
 /// Decode a hex string into bytes. **Not constant time** — used only for public
 /// (non-secret) values such as public keys.
 fn hex_to_bytes(h: &str) -> Result<Vec<u8>, CheetahError> {
-    if h.len() % 2 != 0 {
+    if !h.len().is_multiple_of(2) {
         return Err(CheetahError::InvalidLength(h.len()));
     }
     (0..h.len() / 2)
@@ -362,7 +361,7 @@ mod test {
         // Tampered response.
         let bad = Signature {
             c: sig.c,
-            s: sig.s.add_mod(&U256::ONE, &G_ORDER),
+            s: sig.s.add_mod(&U256::ONE, &G_ORDER_NZ),
         };
         assert!(!pk.verify(&bad, &m));
 
@@ -383,7 +382,7 @@ mod test {
         let pk = sk.public_key().unwrap();
         let m = [3u64, 1, 4, 1, 5];
         let c = challenge(&A_ID, &pk.0, &m);
-        let s = MulMod::mul_mod(&c, &sk.0, &G_ORDER);
+        let s = c.mul_mod(&sk.0, &G_ORDER_NZ);
         let forged = Signature { c, s };
         assert!(
             !pk.verify(&forged, &m),

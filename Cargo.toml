@@ -2,19 +2,17 @@
 name = "cheetah-curve"
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 description = "Cheetah elliptic curve (sextic extension of the Goldilocks field) + Tip5 hash + Goldilocks field arithmetic — the cryptographic primitives behind Nockchain's key-prefixed Schnorr signatures. Vendored from nockchain-math; no Nock VM dependency."
 readme = "README.md"
 keywords = ["cryptography", "schnorr", "nockchain", "goldilocks", "tip5"]
 categories = ["cryptography"]
-authors = ["@nocktoshi", "@nockchain-core"]
+authors = ["@nocktoshi", "Zorp Corp"]
 repository = "https://github.com/nocktoshi/cheetah"
 
 [dependencies]
-# All big-integer arithmetic — scalar field (U256) and the F6 inversion exponent
-# (U384) — uses constant-time crypto-bigint. No variable-time bignum.
-crypto-bigint = { version = "0.6", default-features = false, features = ["zeroize"] }
+crypto-bigint = { version = "0.7.4", default-features = false, features = ["zeroize", "subtle"] }
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 bs58 = "0.5.1"

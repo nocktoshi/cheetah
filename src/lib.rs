@@ -48,15 +48,15 @@ pub mod tip5;
 #[cfg(test)]
 mod golden;
 
-// Re-export the scalar type so downstream crates can name it without depending
-// on `crypto-bigint` directly.
-pub use crypto_bigint::U256;
+// Re-export the scalar big-int types so downstream crates can name them without
+// depending on `crypto-bigint` directly (and stay on the same version).
+pub use crypto_bigint::{NonZero, U256, U512};
 
 // Ergonomic re-exports of the most-used items.
 pub use crate::belt::{Belt, PRIME};
 pub use crate::cheetah::{
     ch_add, ch_neg, ch_scal_big, trunc_g_order, CheetahError, CheetahPoint, F6lt, A_GEN, A_ID,
-    G_ORDER,
+    G_ORDER, G_ORDER_NZ,
 };
 pub use crate::message::{digest_from_message, message_from_digest, tip5_to_bytes, tip5_to_scalar};
 pub use crate::schnorr::{

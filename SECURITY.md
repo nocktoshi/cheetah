@@ -152,11 +152,13 @@ with value-dependent branches; v0.3.x removes them so the whole signing path is
 constant time. The changes, top to bottom:
 
 - **`ch_add`** — a single *unified* affine formula. The slope numerator and
-  denominator are selected in constant time (`subtle`) between the
-  general-addition and doubling cases, one field inversion is performed, and the
-  degenerate results (`P + (−P) = O`, identity operands, 2-torsion doubling) are
-  fixed up with constant-time point selects. No branch or memory access depends
-  on the point values.
+  denominator are selected in constant time between the general-addition and
+  doubling cases, one field inversion is performed, and the degenerate results
+  (`P + (−P) = O`, identity operands, 2-torsion doubling) are fixed up with
+  constant-time point selects. No branch or memory access depends on the point
+  values. (Selection is via `subtle::ConditionallySelectable`, implemented for
+  `F6lt` / `CheetahPoint` / `ProjPoint` — `T::conditional_select(a, b, choice)` is
+  branchless masking, *not* an `if`, which on a secret scalar bit would leak it.)
 - **`ch_double`** — always computes the doubling formula and selects the identity
   for `O` / 2-torsion inputs, again branchlessly.
 - **`ch_scal_big`** — fixed 256-iteration double-and-add in **homogeneous
@@ -239,6 +241,13 @@ Breaking: scalar-bearing types now use `crypto_bigint::U256` instead of
 (`message_from_digest`, `digest_from_message`, `tip5_to_scalar`, `tip5_to_bytes`).
 The `ibig` and `once_cell` dependencies are removed; the `F6` inversion exponent
 is now a `crypto_bigint::U384` constant.
+
+Built against **`crypto-bigint` 0.7** (`features = ["zeroize", "subtle"]`, MSRV
+1.96): modular ops take `&NonZero` moduli (`G_ORDER_NZ`), `mul_mod` is the
+inherent method, and `to_le_bytes`/`to_be_bytes` return `EncodedUint` (converted
+via `.into()` / `.as_ref()`). Constant-time selection is the standard
+`subtle::ConditionallySelectable` trait, implemented for `F6lt` / `CheetahPoint`
+/ `ProjPoint` (replacing the bespoke `*_select` helpers).
 
 The curve point arithmetic (`ch_add`, `ch_double`) and the Goldilocks field
 reductions (`reduce_159`, `mont_reduction`, `bneg`) were made **branchless /

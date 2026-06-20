@@ -1,5 +1,5 @@
 use bs58;
-use crypto_bigint::{U256, U384};
+use crypto_bigint::{NonZero, U256, U384};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 use crate::belt::Belt;
@@ -9,6 +9,10 @@ use crate::belt::Belt;
 /// operations (`add_mod` / `sub_mod` / `mul_mod`).
 pub const G_ORDER: U256 =
     U256::from_be_hex("7af2599b3b3f22d0563fbf0f990a37b5327aa72330157722d443623eaed4accf");
+
+/// `G_ORDER` as a non-zero modulus
+/// (`add_mod` / `sub_mod` / `mul_mod` / `rem`) take `&NonZero`.
+pub const G_ORDER_NZ: NonZero<U256> = NonZero::<U256>::new_unwrap(G_ORDER);
 
 // Powers of the Goldilocks prime P = 2^64 − 2^32 + 1, used by `trunc_g_order` to
 // fold a Tip5 hash output (base-P limbs) into the scalar field. Each is already
@@ -212,7 +216,8 @@ const FERMAT_EXP: U384 =
 fn f6_pow(base: &F6lt, exp: &U384) -> F6lt {
     let mut b = *base;
     let mut acc = F6_ONE;
-    for byte in exp.to_le_bytes() {
+    let le_bytes: [u8; 48] = exp.to_le_bytes().into();
+    for byte in le_bytes {
         for bit in 0..8 {
             if (byte >> bit) & 1 == 1 {
                 acc = f6_mul(&acc, &b);
@@ -296,21 +301,26 @@ fn f6_ct_eq(a: &F6lt, b: &F6lt) -> Choice {
         .fold(Choice::from(1u8), |eq, (x, y)| eq & x.0.ct_eq(&y.0))
 }
 
-/// Constant-time select `choice ? b : a`, limb by limb.
-fn f6_select(a: &F6lt, b: &F6lt, choice: Choice) -> F6lt {
-    let mut o = [Belt(0); 6];
-    for (oi, (ai, bi)) in o.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
-        *oi = Belt(u64::conditional_select(&ai.0, &bi.0, choice));
+// Constant-time selection via `subtle::ConditionallySelectable`:
+// `T::conditional_select(a, b, choice)` returns `choice ? b : a` with no branch
+impl ConditionallySelectable for F6lt {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        let mut o = [Belt(0); 6];
+        for (oi, (ai, bi)) in o.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+            *oi = Belt(u64::conditional_select(&ai.0, &bi.0, choice));
+        }
+        F6lt(o)
     }
-    F6lt(o)
 }
 
-/// Constant-time select of a whole point, `choice ? b : a`.
-fn ch_select(a: &CheetahPoint, b: &CheetahPoint, choice: Choice) -> CheetahPoint {
-    CheetahPoint {
-        x: f6_select(&a.x, &b.x, choice),
-        y: f6_select(&a.y, &b.y, choice),
-        inf: u8::conditional_select(&(a.inf as u8), &(b.inf as u8), choice) != 0,
+impl ConditionallySelectable for CheetahPoint {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        CheetahPoint {
+            x: F6lt::conditional_select(&a.x, &b.x, choice),
+            y: F6lt::conditional_select(&a.y, &b.y, choice),
+            // `bool` isn't `ConditionallySelectable`; round-trip through `u8`.
+            inf: u8::conditional_select(&(a.inf as u8), &(b.inf as u8), choice) != 0,
+        }
     }
 }
 
@@ -325,10 +335,18 @@ pub fn ch_double(p: CheetahPoint) -> Result<CheetahPoint, CheetahError> {
     let lambda = f6_mul(&num, &f6_pow(&den, &FERMAT_EXP));
     let x_out = f6_sub(&f6_square(&lambda), &f6_scal(Belt(2), &p.x));
     let y_out = f6_sub(&f6_mul(&lambda, &f6_sub(&p.x, &x_out)), &p.y);
-    let doubled = CheetahPoint { x: x_out, y: y_out, inf: false };
+    let doubled = CheetahPoint {
+        x: x_out,
+        y: y_out,
+        inf: false,
+    };
     // 2·O = O and 2·(2-torsion) = O.
     let to_identity = Choice::from(p.inf as u8) | f6_ct_eq(&p.y, &F6_ZERO);
-    Ok(ch_select(&doubled, &A_ID, to_identity))
+    Ok(CheetahPoint::conditional_select(
+        &doubled,
+        &A_ID,
+        to_identity,
+    ))
 }
 
 #[inline(always)]
@@ -345,13 +363,7 @@ pub fn ch_neg(p: &CheetahPoint) -> CheetahPoint {
 /// Uses a unified affine formula: the slope numerator/denominator are chosen in
 /// constant time between the general-addition and doubling cases, a single field
 /// inversion is performed, and the degenerate results (`P + (−P) = O`, identity
-/// operands, 2-torsion doubling) are fixed up with constant-time selects. No
-/// branch or memory access depends on the point values, so this is safe to call
-/// on secret-dependent points (e.g. inside [`ch_scal_big`]).
-///
-/// Within the prime-order subgroup the selected denominator is never zero, so the
-/// inversion is exact; for the degenerate cases the meaningless computed value is
-/// discarded by the selects.
+/// operands, 2-torsion doubling) are fixed up with constant-time selects.
 #[inline(always)]
 pub fn ch_add(p: &CheetahPoint, q: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
     let same_x = f6_ct_eq(&p.x, &q.x);
@@ -365,20 +377,24 @@ pub fn ch_add(p: &CheetahPoint, q: &CheetahPoint) -> Result<CheetahPoint, Cheeta
     let num_dbl = f6_add(&f6_scal(Belt(3), &f6_square(&p.x)), &F6_ONE);
     let den_dbl = f6_scal(Belt(2), &p.y);
 
-    let num = f6_select(&num_add, &num_dbl, doubling);
-    let den = f6_select(&den_add, &den_dbl, doubling);
+    let num = F6lt::conditional_select(&num_add, &num_dbl, doubling);
+    let den = F6lt::conditional_select(&den_add, &den_dbl, doubling);
     let lambda = f6_mul(&num, &f6_pow(&den, &FERMAT_EXP));
 
     let x_out = f6_sub(&f6_sub(&f6_square(&lambda), &p.x), &q.x);
     let y_out = f6_sub(&f6_mul(&lambda, &f6_sub(&p.x, &x_out)), &p.y);
-    let general = CheetahPoint { x: x_out, y: y_out, inf: false };
+    let general = CheetahPoint {
+        x: x_out,
+        y: y_out,
+        inf: false,
+    };
 
     // P + (−P) = O (same x, opposite y), or doubling a 2-torsion point (y = 0).
     let to_identity = (same_x & !same_y) | (doubling & f6_ct_eq(&p.y, &F6_ZERO));
-    let result = ch_select(&general, &A_ID, to_identity);
+    let result = CheetahPoint::conditional_select(&general, &A_ID, to_identity);
     // Identity operands: O + Q = Q, P + O = P.
-    let result = ch_select(&result, q, Choice::from(p.inf as u8));
-    let result = ch_select(&result, p, Choice::from(q.inf as u8));
+    let result = CheetahPoint::conditional_select(&result, q, Choice::from(p.inf as u8));
+    let result = CheetahPoint::conditional_select(&result, p, Choice::from(q.inf as u8));
     Ok(result)
 }
 
@@ -418,13 +434,21 @@ struct ProjPoint {
 }
 
 impl ProjPoint {
-    const IDENTITY: ProjPoint = ProjPoint { x: F6_ZERO, y: F6_ONE, z: F6_ZERO };
+    const IDENTITY: ProjPoint = ProjPoint {
+        x: F6_ZERO,
+        y: F6_ONE,
+        z: F6_ZERO,
+    };
 
     /// `(x, y, 1)` for a finite point, else the identity `(0 : 1 : 0)`.
     #[inline(always)]
     fn from_affine(p: &CheetahPoint) -> Self {
-        let finite = ProjPoint { x: p.x, y: p.y, z: F6_ONE };
-        proj_select(&finite, &ProjPoint::IDENTITY, Choice::from(p.inf as u8))
+        let finite = ProjPoint {
+            x: p.x,
+            y: p.y,
+            z: F6_ONE,
+        };
+        ProjPoint::conditional_select(&finite, &ProjPoint::IDENTITY, Choice::from(p.inf as u8))
     }
 
     /// Back to affine `(X/Z, Y/Z)`, or the identity when `Z = 0`. One inversion.
@@ -436,17 +460,17 @@ impl ProjPoint {
             y: f6_mul(&self.y, &zinv),
             inf: false,
         };
-        ch_select(&affine, &A_ID, f6_ct_eq(&self.z, &F6_ZERO))
+        CheetahPoint::conditional_select(&affine, &A_ID, f6_ct_eq(&self.z, &F6_ZERO))
     }
 }
 
-/// Constant-time select `choice ? b : a` for projective points.
-#[inline(always)]
-fn proj_select(a: &ProjPoint, b: &ProjPoint, choice: Choice) -> ProjPoint {
-    ProjPoint {
-        x: f6_select(&a.x, &b.x, choice),
-        y: f6_select(&a.y, &b.y, choice),
-        z: f6_select(&a.z, &b.z, choice),
+impl ConditionallySelectable for ProjPoint {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        ProjPoint {
+            x: F6lt::conditional_select(&a.x, &b.x, choice),
+            y: F6lt::conditional_select(&a.y, &b.y, choice),
+            z: F6lt::conditional_select(&a.z, &b.z, choice),
+        }
     }
 }
 
@@ -503,7 +527,11 @@ fn proj_add(p: &ProjPoint, q: &ProjPoint) -> ProjPoint {
     z3 = f6_mul(&t5, &z3);
     z3 = f6_add(&z3, &t0);
 
-    ProjPoint { x: x3, y: y3, z: z3 }
+    ProjPoint {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// Scalar multiplication `n·p`, constant time.
@@ -518,12 +546,13 @@ fn proj_add(p: &ProjPoint, q: &ProjPoint) -> ProjPoint {
 pub fn ch_scal_big(n: &U256, p: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
     let pp = ProjPoint::from_affine(p);
     let mut acc = ProjPoint::IDENTITY;
-    for byte in n.to_be_bytes() {
+    let be: [u8; 32] = n.to_be_bytes().into();
+    for byte in be {
         for bit in (0..8).rev() {
             acc = proj_add(&acc, &acc); // double
             let acc_plus = proj_add(&acc, &pp); // add
             let take = Choice::from((byte >> bit) & 1);
-            acc = proj_select(&acc, &acc_plus, take);
+            acc = ProjPoint::conditional_select(&acc, &acc_plus, take);
         }
     }
     Ok(acc.to_affine())
@@ -535,19 +564,18 @@ pub fn ch_scal_big(n: &U256, p: &CheetahPoint) -> Result<CheetahPoint, CheetahEr
 /// `mul_mod` reduces the wide product, so nothing overflows 256 bits). `a[4]`,
 /// if present, is unused — only four base-P limbs fit below the subgroup order.
 pub fn trunc_g_order(a: &[u64]) -> U256 {
-    use crypto_bigint::MulMod;
     let mut result = U256::from_u64(a[0]);
     result = result.add_mod(
-        &MulMod::mul_mod(&P_BIG, &U256::from_u64(a[1]), &G_ORDER),
-        &G_ORDER,
+        &P_BIG.mul_mod(&U256::from_u64(a[1]), &G_ORDER_NZ),
+        &G_ORDER_NZ,
     );
     result = result.add_mod(
-        &MulMod::mul_mod(&P_BIG_2, &U256::from_u64(a[2]), &G_ORDER),
-        &G_ORDER,
+        &P_BIG_2.mul_mod(&U256::from_u64(a[2]), &G_ORDER_NZ),
+        &G_ORDER_NZ,
     );
     result = result.add_mod(
-        &MulMod::mul_mod(&P_BIG_3, &U256::from_u64(a[3]), &G_ORDER),
-        &G_ORDER,
+        &P_BIG_3.mul_mod(&U256::from_u64(a[3]), &G_ORDER_NZ),
+        &G_ORDER_NZ,
     );
     result
 }
@@ -726,7 +754,18 @@ mod test {
     fn ch_scal_big_matches_affine_reference() -> Result<(), CheetahError> {
         // The projective (RCB) scalar mul must agree with the affine
         // double-and-add `ch_scal` for a range of scalars.
-        for k in [1u64, 2, 3, 7, 8, 255, 256, 65_537, 0x1234_5678, u32::MAX as u64] {
+        for k in [
+            1u64,
+            2,
+            3,
+            7,
+            8,
+            255,
+            256,
+            65_537,
+            0x1234_5678,
+            u32::MAX as u64,
+        ] {
             assert_eq!(
                 ch_scal_big(&U256::from_u64(k), &A_GEN)?,
                 ch_scal(k, &A_GEN)?,
@@ -736,7 +775,7 @@ mod test {
         // Linearity: (a+b)·G == a·G + b·G.
         let a = U256::from_u64(123_456);
         let b = U256::from_u64(987_654);
-        let sum = ch_scal_big(&a.add_mod(&b, &G_ORDER), &A_GEN)?;
+        let sum = ch_scal_big(&a.add_mod(&b, &G_ORDER_NZ), &A_GEN)?;
         let parts = ch_add(&ch_scal_big(&a, &A_GEN)?, &ch_scal_big(&b, &A_GEN)?)?;
         assert_eq!(sum, parts, "(a+b)·G == a·G + b·G");
         Ok(())
