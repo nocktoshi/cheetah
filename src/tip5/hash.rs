@@ -2,7 +2,7 @@ use super::*;
 use crate::belt::{montify, Belt};
 
 // assert that input is made of base field elements
-pub fn assert_all_based(vecbelt: &Vec<Belt>) {
+pub fn assert_all_based(vecbelt: &[Belt]) {
     vecbelt.iter().for_each(|b| based!(b.0));
 }
 
@@ -152,7 +152,9 @@ pub fn squeeze(sponge: &mut [u64; STATE_SIZE]) -> [u64; RATE] {
     res
 }
 
-pub fn hash_varlen(input_vec: &mut Vec<Belt>) -> [u64; 5] {
+/// Variable-length Tip5 hash of a base-field-element slice, returning the 5-limb
+/// digest. The input is not modified (matching iris's immutable-slice API).
+pub fn hash_varlen(input_vec: &[Belt]) -> [u64; 5] {
     assert_all_based(input_vec);
     let input = input_vec.iter().map(|belt| belt.0).collect::<Vec<_>>();
     hash_belts_slice(&input)
@@ -163,12 +165,26 @@ pub fn create_init_sponge_variable() -> [u64; STATE_SIZE] {
 }
 pub fn create_init_sponge_fixed() -> [u64; STATE_SIZE] {
     [
-        0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 4294967295u64, 4294967295u64,
-        4294967295u64, 4294967295u64, 4294967295u64, 4294967295u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        4294967295u64,
+        4294967295u64,
+        4294967295u64,
+        4294967295u64,
+        4294967295u64,
+        4294967295u64,
     ]
 }
 
-pub fn hash_10(input_vec: &mut Vec<Belt>) -> [u64; 5] {
+pub fn hash_10(input_vec: &[Belt]) -> [u64; 5] {
     // check input
     let (q, r) = tip5_calc_q_r(input_vec);
     assert_eq!(q, 1);
@@ -190,34 +206,43 @@ mod tests {
 
     #[test]
     fn tip5_hash_varlen_public_vectors() {
-        let mut empty = vec![];
+        let empty = vec![];
         assert_eq!(
-            hash_varlen(&mut empty),
+            hash_varlen(&empty),
             [
-                11048995573592393898, 6655187932135147625, 8573492257662932655,
-                4379820112787053727, 3881663824627898703,
+                11048995573592393898,
+                6655187932135147625,
+                8573492257662932655,
+                4379820112787053727,
+                3881663824627898703,
             ]
         );
 
-        let mut one = vec![Belt(2)];
+        let one = vec![Belt(2)];
         assert_eq!(
-            hash_varlen(&mut one),
+            hash_varlen(&one),
             [
-                8342164316692288712, 12061287490523852513, 4038969618836824144,
-                5830796451787599265, 468390350313364562,
+                8342164316692288712,
+                12061287490523852513,
+                4038969618836824144,
+                5830796451787599265,
+                468390350313364562,
             ]
         );
 
-        let mut two = vec![Belt(5), Belt(26)];
+        let two = vec![Belt(5), Belt(26)];
         assert_eq!(
-            hash_varlen(&mut two),
+            hash_varlen(&two),
             [
-                4045697570544439560, 13674194094340317530, 13743008867885290460,
-                6020910684025273897, 3362765570390427021,
+                4045697570544439560,
+                13674194094340317530,
+                13743008867885290460,
+                6020910684025273897,
+                3362765570390427021,
             ]
         );
 
-        let mut ten = vec![
+        let ten = vec![
             Belt(1),
             Belt(2448),
             Belt(1),
@@ -230,10 +255,13 @@ mod tests {
             Belt(0),
         ];
         assert_eq!(
-            hash_varlen(&mut ten),
+            hash_varlen(&ten),
             [
-                12811986333282368874, 13601598673786067780, 3807788325936413287,
-                5511165615113400862, 11490077061305916457,
+                12811986333282368874,
+                13601598673786067780,
+                3807788325936413287,
+                5511165615113400862,
+                11490077061305916457,
             ]
         );
     }

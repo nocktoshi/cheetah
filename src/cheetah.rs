@@ -1,19 +1,24 @@
 use bs58;
-use ibig::UBig;
-use once_cell::sync::Lazy;
+use crypto_bigint::{U256, U384};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
-use crate::belt::{Belt, PRIME};
+use crate::belt::Belt;
 
-pub static G_ORDER: Lazy<UBig> = Lazy::new(|| {
-    UBig::from_str_radix(
-        "7af2599b3b3f22d0563fbf0f990a37b5327aa72330157722d443623eaed4accf", 16,
-    )
-    .expect("G_ORDER constant is valid hex")
-});
+/// Order of the Cheetah prime-order subgroup (255-bit). All scalar-field
+/// arithmetic is performed modulo this value using constant-time `crypto-bigint`
+/// operations (`add_mod` / `sub_mod` / `mul_mod`).
+pub const G_ORDER: U256 =
+    U256::from_be_hex("7af2599b3b3f22d0563fbf0f990a37b5327aa72330157722d443623eaed4accf");
 
-pub static P_BIG: Lazy<UBig> = Lazy::new(|| UBig::from(PRIME));
-pub static P_BIG_2: Lazy<UBig> = Lazy::new(|| &*P_BIG * &*P_BIG);
-pub static P_BIG_3: Lazy<UBig> = Lazy::new(|| &*P_BIG_2 * &*P_BIG);
+// Powers of the Goldilocks prime P = 2^64 − 2^32 + 1, used by `trunc_g_order` to
+// fold a Tip5 hash output (base-P limbs) into the scalar field. Each is already
+// reduced (< G_ORDER), so they are valid operands to `mul_mod`.
+const P_BIG: U256 =
+    U256::from_be_hex("000000000000000000000000000000000000000000000000ffffffff00000001");
+const P_BIG_2: U256 =
+    U256::from_be_hex("00000000000000000000000000000000fffffffe00000002fffffffe00000001");
+const P_BIG_3: U256 =
+    U256::from_be_hex("0000000000000000fffffffd00000005fffffff900000005fffffffd00000001");
 
 pub const A_GEN: CheetahPoint = CheetahPoint {
     x: F6lt([
@@ -68,32 +73,37 @@ pub struct CheetahPoint {
 
 impl CheetahPoint {
     ///  A pubkey consists of a leading 1 byte and 12 base field elements that are 8 bytes each. (12*8) + 1 = 97.
-    const BYTES: usize = 97;
+    pub const BYTES: usize = 97;
     ///  The documented format/version prefix byte written by `into_base58`.
     const FORMAT_PREFIX: u8 = 0x1;
-    pub fn into_base58(&self) -> Result<String, CheetahError> {
+
+    /// Nockchain's 97-byte big-endian wire form:
+    /// `0x01 ‖ y-limbs(reversed, big-endian) ‖ x-limbs(reversed, big-endian)`.
+    ///
+    /// This is the raw byte encoding that `into_base58` base58-encodes and that
+    /// the NEAR MPC contract carries as an opaque public-key blob.
+    pub fn to_be_bytes(&self) -> Result<[u8; Self::BYTES], CheetahError> {
         if self.inf {
             return Err(CheetahError::NotOnCurve);
         }
-        // Convert the Belt values to u64 bytes
-        let mut bytes = Vec::new();
-        bytes.push(Self::FORMAT_PREFIX);
+        let mut o = [0u8; Self::BYTES];
+        o[0] = Self::FORMAT_PREFIX;
+        let mut i = 1;
         for belt in self.y.0.iter().rev().chain(self.x.0.iter().rev()) {
-            bytes.extend_from_slice(&belt.0.to_be_bytes());
+            o[i..i + 8].copy_from_slice(&belt.0.to_be_bytes());
+            i += 8;
         }
-        Ok(bs58::encode(bytes).into_string())
+        Ok(o)
     }
-    pub fn from_base58(b58: &str) -> Result<Self, CheetahError> {
-        let v = bs58::decode(b58).into_vec()?;
+
+    /// Parse the 97-byte big-endian wire form produced by [`Self::to_be_bytes`].
+    /// Validates the format prefix and that the decoded point lies on the curve.
+    pub fn from_be_bytes(v: &[u8]) -> Result<Self, CheetahError> {
         if v.len() != Self::BYTES {
-            if b58.starts_with("zpub") {
-                return Err(CheetahError::ZPubUsed);
-            }
             return Err(CheetahError::InvalidLength(v.len()));
         }
-
-        //  The first byte is the format/version prefix (always 0x01, written by
-        //  `into_base58`). Require it so the base58 encoding of a point is unique.
+        //  The first byte is the format/version prefix (always 0x01). Require it
+        //  so the encoding of a point is unique.
         if v[0] != Self::FORMAT_PREFIX {
             return Err(CheetahError::BadPrefix(v[0]));
         }
@@ -119,6 +129,17 @@ impl CheetahPoint {
         } else {
             Err(CheetahError::NotOnCurve)
         }
+    }
+
+    pub fn into_base58(&self) -> Result<String, CheetahError> {
+        Ok(bs58::encode(self.to_be_bytes()?).into_string())
+    }
+    pub fn from_base58(b58: &str) -> Result<Self, CheetahError> {
+        let v = bs58::decode(b58).into_vec()?;
+        if v.len() != Self::BYTES && b58.starts_with("zpub") {
+            return Err(CheetahError::ZPubUsed);
+        }
+        Self::from_be_bytes(&v)
     }
 
     pub fn in_curve(&self) -> bool {
@@ -178,24 +199,26 @@ pub fn f6_mul(f: &F6lt, g: &F6lt) -> F6lt {
     ])
 }
 
-/// Exponent `p^6 - 2` for Fermat inversion in F_{p^6} (group order is p^6 - 1).
-static FERMAT_EXP: Lazy<UBig> = Lazy::new(|| {
-    let p = UBig::from(PRIME);
-    &p * &p * &p * &p * &p * &p - UBig::from(2u8)
-});
+/// Exponent `p^6 - 2` for Fermat inversion in F_{p^6} (the multiplicative group
+/// order is `p^6 - 1`). A fixed 384-bit public constant.
+const FERMAT_EXP: U384 =
+    U384::from_be_hex("fffffffa00000014ffffffce00000059ffffff820000008cffffff8200000059ffffffce00000014fffffff9ffffffff");
 
-/// `base^exp` in F_{p^6} by square-and-multiply (exp is a big integer).
-fn f6_pow(base: &F6lt, exp: &UBig) -> F6lt {
-    let zero = UBig::from(0u8);
-    let mut n = exp.clone();
+/// `base^exp` in F_{p^6} by square-and-multiply (LSB-first, fixed 384 iterations).
+///
+/// `exp` is the fixed public Fermat exponent, so the operation sequence is
+/// data-independent — the only secret is `base`, and `f6_mul`/`f6_square` run on
+/// it identically every call regardless of its value.
+fn f6_pow(base: &F6lt, exp: &U384) -> F6lt {
     let mut b = *base;
     let mut acc = F6_ONE;
-    while n > zero {
-        if n.bit(0) {
-            acc = f6_mul(&acc, &b);
+    for byte in exp.to_le_bytes() {
+        for bit in 0..8 {
+            if (byte >> bit) & 1 == 1 {
+                acc = f6_mul(&acc, &b);
+            }
+            b = f6_square(&b);
         }
-        b = f6_square(&b);
-        n >>= 1;
     }
     acc
 }
@@ -226,7 +249,14 @@ fn f6_add(f1: &F6lt, f2: &F6lt) -> F6lt {
 }
 
 fn f6_scal(s: Belt, f: &F6lt) -> F6lt {
-    F6lt([f.0[0] * s, f.0[1] * s, f.0[2] * s, f.0[3] * s, f.0[4] * s, f.0[5] * s])
+    F6lt([
+        f.0[0] * s,
+        f.0[1] * s,
+        f.0[2] * s,
+        f.0[3] * s,
+        f.0[4] * s,
+        f.0[5] * s,
+    ])
 }
 
 // TODO: Try karat3-square if performance is an issue
@@ -245,21 +275,6 @@ fn f6_sub(f1: &F6lt, f2: &F6lt) -> F6lt {
     f6_add(f1, &f6_neg(f2))
 }
 
-#[inline(always)]
-pub fn ch_double_unsafe(x: &F6lt, y: &F6lt) -> Result<CheetahPoint, CheetahError> {
-    let slope = f6_div(
-        &f6_add(&f6_scal(Belt(3), &f6_square(x)), &F6_ONE),
-        &f6_scal(Belt(2), y),
-    )?;
-    let x_out = f6_sub(&f6_square(&slope), &f6_scal(Belt(2), x));
-    let y_out = f6_sub(&f6_mul(&slope, &f6_sub(x, &x_out)), y);
-    Ok(CheetahPoint {
-        x: x_out,
-        y: y_out,
-        inf: false,
-    })
-}
-
 pub const A_ID: CheetahPoint = CheetahPoint {
     x: F6_ZERO,
     y: F6_ONE,
@@ -268,27 +283,52 @@ pub const A_ID: CheetahPoint = CheetahPoint {
 pub const F6_ZERO: F6lt = F6lt([Belt(0); 6]);
 pub const F6_ONE: F6lt = F6lt([Belt(1), Belt(0), Belt(0), Belt(0), Belt(0), Belt(0)]);
 
-#[inline(always)]
-pub fn ch_double(p: CheetahPoint) -> Result<CheetahPoint, CheetahError> {
-    if p.inf {
-        return Ok(A_ID);
-    }
-    if p.y == F6_ZERO {
-        return Ok(A_ID);
-    }
-    ch_double_unsafe(&p.x, &p.y)
+// ---- constant-time helpers --------------------------------------------------
+//
+// `Belt` is a canonical field element (`#[derive(PartialEq)]` over its `u64`),
+// so constant-time equality and selection on the raw `u64` are sound — they are
+// the timing-invariant equivalents of the `==` the curve code used previously.
+
+/// Constant-time equality of two `F6` elements.
+fn f6_ct_eq(a: &F6lt, b: &F6lt) -> Choice {
+    a.0.iter()
+        .zip(b.0.iter())
+        .fold(Choice::from(1u8), |eq, (x, y)| eq & x.0.ct_eq(&y.0))
 }
 
+/// Constant-time select `choice ? b : a`, limb by limb.
+fn f6_select(a: &F6lt, b: &F6lt, choice: Choice) -> F6lt {
+    let mut o = [Belt(0); 6];
+    for (oi, (ai, bi)) in o.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+        *oi = Belt(u64::conditional_select(&ai.0, &bi.0, choice));
+    }
+    F6lt(o)
+}
+
+/// Constant-time select of a whole point, `choice ? b : a`.
+fn ch_select(a: &CheetahPoint, b: &CheetahPoint, choice: Choice) -> CheetahPoint {
+    CheetahPoint {
+        x: f6_select(&a.x, &b.x, choice),
+        y: f6_select(&a.y, &b.y, choice),
+        inf: u8::conditional_select(&(a.inf as u8), &(b.inf as u8), choice) != 0,
+    }
+}
+
+/// Point doubling `2P`, constant time. The identity and 2-torsion points
+/// (`y = 0`) map to the identity; all timing is independent of `P`.
 #[inline(always)]
-pub fn ch_add_unsafe(p: CheetahPoint, q: CheetahPoint) -> Result<CheetahPoint, CheetahError> {
-    let slope = f6_div(&f6_sub(&p.y, &q.y), &f6_sub(&p.x, &q.x))?;
-    let x_out = f6_sub(&f6_square(&slope), &f6_add(&p.x, &q.x));
-    let y_out = f6_sub(&f6_mul(&slope, &f6_sub(&p.x, &x_out)), &p.y);
-    Ok(CheetahPoint {
-        x: x_out,
-        y: y_out,
-        inf: false,
-    })
+pub fn ch_double(p: CheetahPoint) -> Result<CheetahPoint, CheetahError> {
+    // λ = (3x² + a) / 2y, with a = 1. `f6_pow(·, p^6−2)` is the field inverse and
+    // returns 0 for a 0 input (no error), so the degenerate cases below are safe.
+    let num = f6_add(&f6_scal(Belt(3), &f6_square(&p.x)), &F6_ONE);
+    let den = f6_scal(Belt(2), &p.y);
+    let lambda = f6_mul(&num, &f6_pow(&den, &FERMAT_EXP));
+    let x_out = f6_sub(&f6_square(&lambda), &f6_scal(Belt(2), &p.x));
+    let y_out = f6_sub(&f6_mul(&lambda, &f6_sub(&p.x, &x_out)), &p.y);
+    let doubled = CheetahPoint { x: x_out, y: y_out, inf: false };
+    // 2·O = O and 2·(2-torsion) = O.
+    let to_identity = Choice::from(p.inf as u8) | f6_ct_eq(&p.y, &F6_ZERO);
+    Ok(ch_select(&doubled, &A_ID, to_identity))
 }
 
 #[inline(always)]
@@ -300,21 +340,46 @@ pub fn ch_neg(p: &CheetahPoint) -> CheetahPoint {
     }
 }
 
+/// Point addition `P + Q`, constant time for points in the prime-order subgroup.
+///
+/// Uses a unified affine formula: the slope numerator/denominator are chosen in
+/// constant time between the general-addition and doubling cases, a single field
+/// inversion is performed, and the degenerate results (`P + (−P) = O`, identity
+/// operands, 2-torsion doubling) are fixed up with constant-time selects. No
+/// branch or memory access depends on the point values, so this is safe to call
+/// on secret-dependent points (e.g. inside [`ch_scal_big`]).
+///
+/// Within the prime-order subgroup the selected denominator is never zero, so the
+/// inversion is exact; for the degenerate cases the meaningless computed value is
+/// discarded by the selects.
 #[inline(always)]
 pub fn ch_add(p: &CheetahPoint, q: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
-    if p.inf {
-        return Ok(*q);
-    }
-    if q.inf {
-        return Ok(*p);
-    }
-    if *p == ch_neg(q) {
-        return Ok(A_ID);
-    }
-    if p == q {
-        return ch_double(*p);
-    }
-    ch_add_unsafe(*p, *q)
+    let same_x = f6_ct_eq(&p.x, &q.x);
+    let same_y = f6_ct_eq(&p.y, &q.y);
+    let doubling = same_x & same_y;
+
+    // General addition: λ = (y_p − y_q)/(x_p − x_q).
+    let num_add = f6_sub(&p.y, &q.y);
+    let den_add = f6_sub(&p.x, &q.x);
+    // Doubling: λ = (3·x_p² + 1)/(2·y_p).
+    let num_dbl = f6_add(&f6_scal(Belt(3), &f6_square(&p.x)), &F6_ONE);
+    let den_dbl = f6_scal(Belt(2), &p.y);
+
+    let num = f6_select(&num_add, &num_dbl, doubling);
+    let den = f6_select(&den_add, &den_dbl, doubling);
+    let lambda = f6_mul(&num, &f6_pow(&den, &FERMAT_EXP));
+
+    let x_out = f6_sub(&f6_sub(&f6_square(&lambda), &p.x), &q.x);
+    let y_out = f6_sub(&f6_mul(&lambda, &f6_sub(&p.x, &x_out)), &p.y);
+    let general = CheetahPoint { x: x_out, y: y_out, inf: false };
+
+    // P + (−P) = O (same x, opposite y), or doubling a 2-torsion point (y = 0).
+    let to_identity = (same_x & !same_y) | (doubling & f6_ct_eq(&p.y, &F6_ZERO));
+    let result = ch_select(&general, &A_ID, to_identity);
+    // Identity operands: O + Q = Q, P + O = P.
+    let result = ch_select(&result, q, Choice::from(p.inf as u8));
+    let result = ch_select(&result, p, Choice::from(q.inf as u8));
+    Ok(result)
 }
 
 #[inline(always)]
@@ -332,59 +397,161 @@ pub fn ch_scal(n: u64, p: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
     Ok(acc)
 }
 
-#[inline(always)]
-pub fn ch_scal_big(n: &UBig, p: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
-    let mut n_copy = n.clone();
-    let zero = UBig::from(0u64);
-    let mut p_copy = *p;
-    let mut acc = A_ID;
+// ---- projective coordinates (RCB complete addition) -------------------------
+//
+// Homogeneous projective points `(X : Y : Z)` represent the affine `(X/Z, Y/Z)`
+// with identity `(0 : 1 : 0)`. Scalar multiplication runs here to avoid a field
+// inversion per point operation: the Renes–Costello–Batina complete addition
+// formula (EUROCRYPT 2016, Algorithm 1) is branchless and exception-free for the
+// prime-order subgroup, so only one inversion is needed at the very end to return
+// to affine.
 
-    while n_copy > zero {
-        // Check if least significant bit is set
-        if n_copy.bit(0) {
-            acc = ch_add(&acc, &p_copy)?;
+/// `b3 = 3·b` for the Cheetah curve `y² = x³ + x + b` (`a = 1`), as an `F6`
+/// element — the only curve-specific constant the RCB formula needs.
+const B3: F6lt = F6lt([Belt(1185), Belt(3), Belt(0), Belt(0), Belt(0), Belt(0)]);
+
+#[derive(Clone, Copy)]
+struct ProjPoint {
+    x: F6lt,
+    y: F6lt,
+    z: F6lt,
+}
+
+impl ProjPoint {
+    const IDENTITY: ProjPoint = ProjPoint { x: F6_ZERO, y: F6_ONE, z: F6_ZERO };
+
+    /// `(x, y, 1)` for a finite point, else the identity `(0 : 1 : 0)`.
+    #[inline(always)]
+    fn from_affine(p: &CheetahPoint) -> Self {
+        let finite = ProjPoint { x: p.x, y: p.y, z: F6_ONE };
+        proj_select(&finite, &ProjPoint::IDENTITY, Choice::from(p.inf as u8))
+    }
+
+    /// Back to affine `(X/Z, Y/Z)`, or the identity when `Z = 0`. One inversion.
+    #[inline(always)]
+    fn to_affine(self) -> CheetahPoint {
+        let zinv = f6_pow(&self.z, &FERMAT_EXP); // 0 when Z == 0 (no error)
+        let affine = CheetahPoint {
+            x: f6_mul(&self.x, &zinv),
+            y: f6_mul(&self.y, &zinv),
+            inf: false,
+        };
+        ch_select(&affine, &A_ID, f6_ct_eq(&self.z, &F6_ZERO))
+    }
+}
+
+/// Constant-time select `choice ? b : a` for projective points.
+#[inline(always)]
+fn proj_select(a: &ProjPoint, b: &ProjPoint, choice: Choice) -> ProjPoint {
+    ProjPoint {
+        x: f6_select(&a.x, &b.x, choice),
+        y: f6_select(&a.y, &b.y, choice),
+        z: f6_select(&a.z, &b.z, choice),
+    }
+}
+
+/// Renes–Costello–Batina complete addition (Algorithm 1, specialized to `a = 1`,
+/// so the three `a·_` multiplications drop out). Branchless and exception-free
+/// for points in the prime-order subgroup, and unified — it also yields `2P`
+/// when `P = Q` and handles the identity, so the scalar-mul loop needs no special
+/// cases.
+//
+// Not `inline(always)`: it is called 512× per scalar multiplication, and forcing
+// it inline blows up the (debug) stack frame.
+fn proj_add(p: &ProjPoint, q: &ProjPoint) -> ProjPoint {
+    let (x1, y1, z1) = (p.x, p.y, p.z);
+    let (x2, y2, z2) = (q.x, q.y, q.z);
+
+    let mut t0 = f6_mul(&x1, &x2);
+    let mut t1 = f6_mul(&y1, &y2);
+    let mut t2 = f6_mul(&z1, &z2);
+    let mut t3 = f6_add(&x1, &y1);
+    let mut t4 = f6_add(&x2, &y2);
+    t3 = f6_mul(&t3, &t4);
+    t4 = f6_add(&t0, &t1);
+    t3 = f6_sub(&t3, &t4);
+    t4 = f6_add(&x1, &z1);
+    let mut t5 = f6_add(&x2, &z2);
+    t4 = f6_mul(&t4, &t5);
+    t5 = f6_add(&t0, &t2);
+    t4 = f6_sub(&t4, &t5);
+    t5 = f6_add(&y1, &z1);
+    let mut x3 = f6_add(&y2, &z2);
+    t5 = f6_mul(&t5, &x3);
+    x3 = f6_add(&t1, &t2);
+    t5 = f6_sub(&t5, &x3);
+    let mut z3 = t4; // a · t4 with a = 1
+    x3 = f6_mul(&B3, &t2);
+    z3 = f6_add(&x3, &z3);
+    x3 = f6_sub(&t1, &z3);
+    z3 = f6_add(&t1, &z3);
+    let mut y3 = f6_mul(&x3, &z3);
+    t1 = f6_add(&t0, &t0);
+    t1 = f6_add(&t1, &t0);
+    // a · t2 with a = 1 → t2 unchanged.
+    t4 = f6_mul(&B3, &t4);
+    t1 = f6_add(&t1, &t2);
+    t2 = f6_sub(&t0, &t2);
+    // a · t2 with a = 1 → t2 unchanged.
+    t4 = f6_add(&t4, &t2);
+    t0 = f6_mul(&t1, &t4);
+    y3 = f6_add(&y3, &t0);
+    t0 = f6_mul(&t5, &t4);
+    x3 = f6_mul(&t3, &x3);
+    x3 = f6_sub(&x3, &t0);
+    t0 = f6_mul(&t3, &t1);
+    z3 = f6_mul(&t5, &z3);
+    z3 = f6_add(&z3, &t0);
+
+    ProjPoint { x: x3, y: y3, z: z3 }
+}
+
+/// Scalar multiplication `n·p`, constant time.
+///
+/// Fixed 256-iteration double-and-add in homogeneous projective coordinates: each
+/// step does one [`proj_add`] doubling and one addition (with **no** per-operation
+/// field inversion — a single inversion at the end converts back to affine) and
+/// selects the sum in constant time, so neither the bit length nor the Hamming
+/// weight of `n` is revealed. RCB addition is branchless and exception-free in the
+/// prime-order subgroup. See `SECURITY.md`.
+#[inline(always)]
+pub fn ch_scal_big(n: &U256, p: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
+    let pp = ProjPoint::from_affine(p);
+    let mut acc = ProjPoint::IDENTITY;
+    for byte in n.to_be_bytes() {
+        for bit in (0..8).rev() {
+            acc = proj_add(&acc, &acc); // double
+            let acc_plus = proj_add(&acc, &pp); // add
+            let take = Choice::from((byte >> bit) & 1);
+            acc = proj_select(&acc, &acc_plus, take);
         }
-        p_copy = ch_double(p_copy)?;
-        n_copy >>= 1; // Right shift by 1 bit
     }
-    Ok(acc)
+    Ok(acc.to_affine())
 }
 
-/// Number of 32-bit (bloq-5) blocks in `x`, i.e. Hoon `(met 5 x)`; 0 for `x == 0`.
-#[inline(always)]
-fn met5(x: u64) -> u32 {
-    if x == 0 {
-        0
-    } else {
-        (64 - x.leading_zeros()).div_ceil(32)
-    }
+/// Fold a Tip5 hash output into the scalar field:
+/// `(a[0] + P·a[1] + P²·a[2] + P³·a[3]) mod G_ORDER`, where `P` is the Goldilocks
+/// prime. Computed with constant-time `crypto-bigint` modular multiply/add (each
+/// `mul_mod` reduces the wide product, so nothing overflows 256 bits). `a[4]`,
+/// if present, is unused — only four base-P limbs fit below the subgroup order.
+pub fn trunc_g_order(a: &[u64]) -> U256 {
+    use crypto_bigint::MulMod;
+    let mut result = U256::from_u64(a[0]);
+    result = result.add_mod(
+        &MulMod::mul_mod(&P_BIG, &U256::from_u64(a[1]), &G_ORDER),
+        &G_ORDER,
+    );
+    result = result.add_mod(
+        &MulMod::mul_mod(&P_BIG_2, &U256::from_u64(a[2]), &G_ORDER),
+        &G_ORDER,
+    );
+    result = result.add_mod(
+        &MulMod::mul_mod(&P_BIG_3, &U256::from_u64(a[3]), &G_ORDER),
+        &G_ORDER,
+    );
+    result
 }
 
-/// Reconstruct a belt-schnorr scalar from its `t8` limbs exactly as Hoon
-/// `t8-to-atom` = `(rap 5 (leaf-sequence:shape t))`:
-///
-///   `rap 5 [l0 l1 ...] = cat(5, l0, cat(5, l1, ...))`
-///   `cat(5, b, c)      = b + (c << 32*(met 5 b))`
-///
-/// `(met 5 0) == 0`, so a zero limb does not advance the position — this is not a
-/// plain base-2^32 reconstruction. Limbs are field elements (`< prime < 2^64`).
-pub fn belt_schnorr_t8_to_ubig(limbs: &[Belt]) -> UBig {
-    let mut acc = UBig::from(0u8);
-    for limb in limbs.iter().rev() {
-        let shift = (32 * met5(limb.0)) as usize;
-        acc = UBig::from(limb.0) + (acc << shift);
-    }
-    acc
-}
-
-pub fn trunc_g_order(a: &[u64]) -> UBig {
-    let mut result = UBig::from(a[0]);
-    result += &*P_BIG * UBig::from(a[1]);
-    result += &*P_BIG_2 * UBig::from(a[2]);
-    result += &*P_BIG_3 * UBig::from(a[3]);
-
-    result % &*G_ORDER
-}
 #[cfg(test)]
 mod test {
     use super::*;
@@ -479,7 +646,14 @@ mod test {
     #[test]
     fn test_f6_div() -> Result<(), CheetahError> {
         let f1 = F6_TEST;
-        let f2 = F6lt([Belt(0xdeadbeef), Belt(0xdead0001), Belt(0), Belt(0), Belt(0), Belt(0)]);
+        let f2 = F6lt([
+            Belt(0xdeadbeef),
+            Belt(0xdead0001),
+            Belt(0),
+            Belt(0),
+            Belt(0),
+            Belt(0),
+        ]);
         let res = f6_div(&f1, &f2)?;
         assert_eq!(
             res,
@@ -522,6 +696,49 @@ mod test {
         let res = ch_scal(n, &A_GEN)?;
 
         assert_eq!(res, exp_pt);
+        Ok(())
+    }
+
+    #[test]
+    fn ch_add_edge_cases() -> Result<(), CheetahError> {
+        // The constant-time unified `ch_add`/`ch_double` must still handle every
+        // special case the old branchy version did.
+        let g = A_GEN;
+        let two_g = ch_double(g)?;
+        let three_g = ch_scal(3, &g)?;
+
+        // Identity operands.
+        assert_eq!(ch_add(&g, &A_ID)?, g, "P + O = P");
+        assert_eq!(ch_add(&A_ID, &g)?, g, "O + P = P");
+        assert_eq!(ch_add(&A_ID, &A_ID)?, A_ID, "O + O = O");
+        // P + (-P) = O.
+        assert_eq!(ch_add(&g, &ch_neg(&g))?, A_ID, "P + (-P) = O");
+        // Doubling via ch_add (P == Q).
+        assert_eq!(ch_add(&g, &g)?, two_g, "P + P = 2P");
+        // General addition (distinct points).
+        assert_eq!(ch_add(&g, &two_g)?, three_g, "G + 2G = 3G");
+        // Consistency with scalar-mul by the subgroup order: order·G = O.
+        assert_eq!(ch_scal_big(&G_ORDER, &g)?, A_ID, "n·G = O");
+        Ok(())
+    }
+
+    #[test]
+    fn ch_scal_big_matches_affine_reference() -> Result<(), CheetahError> {
+        // The projective (RCB) scalar mul must agree with the affine
+        // double-and-add `ch_scal` for a range of scalars.
+        for k in [1u64, 2, 3, 7, 8, 255, 256, 65_537, 0x1234_5678, u32::MAX as u64] {
+            assert_eq!(
+                ch_scal_big(&U256::from_u64(k), &A_GEN)?,
+                ch_scal(k, &A_GEN)?,
+                "k = {k}"
+            );
+        }
+        // Linearity: (a+b)·G == a·G + b·G.
+        let a = U256::from_u64(123_456);
+        let b = U256::from_u64(987_654);
+        let sum = ch_scal_big(&a.add_mod(&b, &G_ORDER), &A_GEN)?;
+        let parts = ch_add(&ch_scal_big(&a, &A_GEN)?, &ch_scal_big(&b, &A_GEN)?)?;
+        assert_eq!(sum, parts, "(a+b)·G == a·G + b·G");
         Ok(())
     }
 }

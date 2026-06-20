@@ -18,17 +18,7 @@ pub const R2: u128 = 18446744065119617025;
 pub const H: u64 = 20033703337;
 pub const ORDER: u64 = 2_u64.pow(32);
 
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Default,
-)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 /// Prime-field element modulo [`PRIME`].
 ///
@@ -113,14 +103,38 @@ impl Belt {
 }
 
 const ROOTS: &[u64] = &[
-    0x0000000000000001, 0xffffffff00000000, 0x0001000000000000, 0xfffffffeff000001,
-    0xefffffff00000001, 0x00003fffffffc000, 0x0000008000000000, 0xf80007ff08000001,
-    0xbf79143ce60ca966, 0x1905d02a5c411f4e, 0x9d8f2ad78bfed972, 0x0653b4801da1c8cf,
-    0xf2c35199959dfcb6, 0x1544ef2335d17997, 0xe0ee099310bba1e2, 0xf6b2cffe2306baac,
-    0x54df9630bf79450e, 0xabd0a6e8aa3d8a0e, 0x81281a7b05f9beac, 0xfbd41c6b8caa3302,
-    0x30ba2ecd5e93e76d, 0xf502aef532322654, 0x4b2a18ade67246b5, 0xea9d5a1336fbc98b,
-    0x86cdcc31c307e171, 0x4bbaf5976ecfefd8, 0xed41d05b78d6e286, 0x10d78dd8915a171d,
-    0x59049500004a4485, 0xdfa8c93ba46d2666, 0x7e9bd009b86a0845, 0x400a7f755588e659,
+    0x0000000000000001,
+    0xffffffff00000000,
+    0x0001000000000000,
+    0xfffffffeff000001,
+    0xefffffff00000001,
+    0x00003fffffffc000,
+    0x0000008000000000,
+    0xf80007ff08000001,
+    0xbf79143ce60ca966,
+    0x1905d02a5c411f4e,
+    0x9d8f2ad78bfed972,
+    0x0653b4801da1c8cf,
+    0xf2c35199959dfcb6,
+    0x1544ef2335d17997,
+    0xe0ee099310bba1e2,
+    0xf6b2cffe2306baac,
+    0x54df9630bf79450e,
+    0xabd0a6e8aa3d8a0e,
+    0x81281a7b05f9beac,
+    0xfbd41c6b8caa3302,
+    0x30ba2ecd5e93e76d,
+    0xf502aef532322654,
+    0x4b2a18ade67246b5,
+    0xea9d5a1336fbc98b,
+    0x86cdcc31c307e171,
+    0x4bbaf5976ecfefd8,
+    0xed41d05b78d6e286,
+    0x10d78dd8915a171d,
+    0x59049500004a4485,
+    0xdfa8c93ba46d2666,
+    0x7e9bd009b86a0845,
+    0x400a7f755588e659,
     0x185629dcda58878c,
 ];
 
@@ -309,11 +323,11 @@ pub fn mont_reduction(a: u128) -> u64 {
     };
     let f: u128 = c >> 64;
     let d: u128 = c - (x1 + (f * PRIME_128));
-    if x2 >= d {
-        (x2 - d) as u64
-    } else {
-        (x2 + PRIME_128 - d) as u64
-    }
+    // Constant time: `if x2 >= d { x2 - d } else { x2 + PRIME_128 - d }`, applied
+    // branchlessly via a borrow mask (byte-identical to the conditional form).
+    let (r, borrow) = x2.overflowing_sub(d);
+    let mask = 0u128.wrapping_sub(borrow as u128); // all-ones if x2 < d
+    r.wrapping_add(mask & PRIME_128) as u64
 }
 
 #[inline(always)]
@@ -345,11 +359,9 @@ pub fn badd(a: u64, b: u64) -> u64 {
 #[inline(always)]
 pub fn bneg(a: u64) -> u64 {
     based!(a);
-    if a != 0 {
-        PRIME - a
-    } else {
-        0
-    }
+    // `0 - a (mod PRIME)`; `bsub` is branchless and maps `a == 0` to `0`, so this
+    // is constant time and byte-identical to the former `if a != 0 { PRIME - a }`.
+    bsub(0, a)
 }
 
 #[inline(always)]
@@ -368,42 +380,38 @@ pub fn reduce(n: u128) -> u64 {
     reduce_159(n as u64, (n >> 64) as u32, (n >> 96) as u64)
 }
 
-/// Reduce a 159 bit number
+/// All-ones mask if `flag`, else zero — for branchless conditional add/sub.
+#[inline(always)]
+const fn ct_mask_u64(flag: bool) -> u64 {
+    0u64.wrapping_sub(flag as u64)
+}
+
+/// Reduce a 159 bit number.
 /// See <https://cp4space.hatsya.com/2021/09/01/an-efficient-prime-for-number-theoretic-transforms/>
 /// See <https://github.com/mir-protocol/plonky2/blob/3a6d693f3ffe5aa1636e0066a4ea4885a10b5cdf/field/src/goldilocks_field.rs#L340-L356>
-/// Removing both branch_hints can cause misleading changes to performance. bmul and especially
-/// bpow in their micro-benchmarks will appear to be faster but higher-level stuff like bp_fft
-/// will be slower. Make sure you validate your changes across the whole benchmark suite.
-/// We have wrapping benchmarks (bpow(PRIME - 1, 5)) that are meant to be sensitive to the edge
-/// cases but they seem to get faster anyway.
+///
+/// **Constant time.** The original carried three data-dependent conditional
+/// subtracts/adds (which relied on the optimizer emitting `cmov`); here each is
+/// applied through a mask derived from the carry/borrow flag, so the timing is
+/// independent of the operand values. The arithmetic is byte-identical to the
+/// branchy form (validated by the Tip5 known-answer and curve golden vectors).
 #[inline(always)]
 pub fn reduce_159(low: u64, mid: u32, high: u64) -> u64 {
-    let (mut low2, carry) = low.overflowing_sub(high);
-    if carry {
-        low2 = low2.wrapping_add(PRIME);
-    }
+    // if low < high (borrow), add PRIME back.
+    let (low2, borrow) = low.overflowing_sub(high);
+    let low2 = low2.wrapping_add(ct_mask_u64(borrow) & PRIME);
 
     let mut product = (mid as u64) << 32;
     product -= product >> 32;
 
-    let (mut result, carry) = product.overflowing_add(low2);
-    if carry {
-        // This branch is likely to happen. It should compile to a use
-        // branchless conditional operations. This seems counter-intuitive,
-        // but we get better performance out of bpow from this branch_hint.
-        result = result.wrapping_sub(PRIME);
-    }
+    // if the add overflowed, subtract PRIME.
+    let (result, carry) = product.overflowing_add(low2);
+    let result = result.wrapping_sub(ct_mask_u64(carry) & PRIME);
 
-    if result >= PRIME {
-        // TODO: 2025-04-26: Chris A: I'm not sure that it's actually guaranteed,
-        // when I unified the two branches, it caused an error.
-        // This branch is unlikely to happen. It is guaranteed not to be taken
-        // if the above branch was taken. (But merging the two branches is
-        // slower.)
-        // TODO: 2025-04-26: Chris A: +20% improvement to roswell prove_block pow/128 vs. branch_hint
-        result -= PRIME;
-    }
-    result
+    // Final canonicalization: if result >= PRIME, subtract PRIME.
+    let (sub, lt) = result.overflowing_sub(PRIME); // lt ⇔ result < PRIME (keep)
+    let keep = ct_mask_u64(lt);
+    (result & keep) | (sub & !keep)
 }
 
 #[inline(always)]
