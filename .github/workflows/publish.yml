@@ -1,4 +1,4 @@
-name: Publish to crates.io
+name: Build and Test
 
 on:
   push:
@@ -79,7 +79,7 @@ jobs:
         run: cargo build --release
 
   release:
-    name: Publish cheetah-curve
+    name: Publish cheetah-curve on crates.io
     needs: [check-version, ci]
     if: needs.check-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
