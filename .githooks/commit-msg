@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit_msg_file="${1:?missing commit message file}"
+first_line=$(head -n1 "${commit_msg_file}")
+
+allow() {
+  printf '%s\n' "${first_line}" | grep -Eq "${1}"
+}
+
+# Merge/rebase helper commits are always allowed.
+if allow '^Merge '; then
+  exit 0
+fi
+if allow '^Revert '; then
+  exit 0
+fi
+if allow '^fixup! '; then
+  exit 0
+fi
+if allow '^squash! '; then
+  exit 0
+fi
+
+conventional_pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|security|style|test)(\([^)]+\))?!?: .+'
+
+if allow "${conventional_pattern}"; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+Commit message must follow Conventional Commits.
+
+Format:
+  <type>[optional scope][!]: <description>
+
+Allowed types:
+  build, chore, ci, docs, feat, fix, perf, refactor, revert, security, style, test
+
+Examples:
+  feat: add threshold signing helper
+  fix(schnorr): reject identity R prime
+  chore: bump crypto-bigint
+EOF
+
+exit 1

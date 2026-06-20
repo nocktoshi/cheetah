@@ -1,0 +1,112 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish cheetah-curve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ "v${version}" != "${tag}" ]; then
+            echo "::error::Tag ${tag} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_notes
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF#refs/tags/}"
+          version=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          prev_tag=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+
+          if [ -n "${prev_tag}" ]; then
+            range="${prev_tag}..${tag}"
+            compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${prev_tag}...${tag}"
+            header="Changes since [${prev_tag}](${compare_url}):"
+          else
+            range="${tag}"
+            header="Initial release."
+          fi
+
+          commits=$(git log "${range}" --pretty=format:"%s|%h" --no-merges || true)
+
+          append_section() {
+            local heading="$1"
+            local pattern="$2"
+            local matches
+
+            matches=$(printf '%s\n' "${commits}" | grep -E "${pattern}" || true)
+            if [ -n "${matches}" ]; then
+              printf '\n### %s\n' "${heading}"
+              printf '%s\n' "${matches}" | while IFS='|' read -r subject hash; do
+                summary=$(printf '%s' "${subject}" | sed -E 's/^(feat|fix|chore|docs|perf|refactor|security|test|ci)(\([^)]+\))?: ?//')
+                printf -- '- %s (%s)\n' "${summary}" "${hash}"
+              done
+            fi
+          }
+
+          {
+            printf '## cheetah-curve %s\n\n' "${version}"
+            printf 'Published to [crates.io](https://crates.io/crates/cheetah-curve/%s).\n\n' "${version}"
+            printf '%s\n' "${header}"
+            append_section "Features" '^feat(\(|:)'
+            append_section "Fixes" '^fix(\(|:)'
+            append_section "Performance" '^perf(\(|:)'
+            append_section "Security" '^security(\(|:)'
+            append_section "Refactoring" '^refactor(\(|:)'
+            append_section "Documentation" '^docs(\(|:)'
+            append_section "Maintenance" '^chore(\(|:)'
+
+            other=$(printf '%s\n' "${commits}" | grep -Ev '^(feat|fix|chore|docs|perf|refactor|security|test|ci)(\(|\:)' || true)
+            if [ -n "${other}" ]; then
+              printf '\n### Other\n'
+              printf '%s\n' "${other}" | while IFS='|' read -r subject hash; do
+                printf -- '- %s (%s)\n' "${subject}" "${hash}"
+              done
+            fi
+          } > release_body.md
+
+          {
+            echo 'body<<EOF'
+            cat release_body.md
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Publish to crates.io
+        run: cargo publish --locked --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: cheetah-curve ${{ github.ref_name }}
+          body: ${{ steps.release_notes.outputs.body }}
