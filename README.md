@@ -41,6 +41,51 @@ let sig = Signature::from_le_bytes(&sig_bytes);
 assert!(child.verify(&sig, &digest));
 ```
 
+## Mathematical background
+
+The Cheetah curve was designed by Toposware; the original write-up is
+[*The Cheetah curve*](https://toposware.com/blog/cheetah-curve/).
+
+**Base field.** Everything is built over the Goldilocks prime field $\mathbb{F}_p$
+with
+
+$$p = 2^{64} - 2^{32} + 1 = 18446744069414584321.$$
+
+This is the field implemented by the **`belt`** module.
+
+**Sextic extension.** The curve lives over the degree-6 extension
+$\mathbb{F}_{p^6}$, realized as the quotient
+
+$$\mathbb{F}_{p^6} = \mathbb{F}_p[X]\,/\,(X^6 - 7).$$
+
+Writing $u$ for the image of $X$, every element is a polynomial of degree at most
+$5$ in $u$ with coefficients in $\mathbb{F}_p$ (six Goldilocks limbs — the
+`F6lt` type), and $u$ satisfies the defining relation
+
+$$u^6 = 7.$$
+
+This is why F6 multiplication folds the high terms back in with a factor of
+`7` (see `Belt(7)` in [`src/cheetah.rs`](src/cheetah.rs)).
+
+**Curve equation.** Over $\mathbb{F}_{p^6}$, Cheetah is the short Weierstrass
+curve
+
+$$E : y^2 = x^3 + x + (u + 395),$$
+
+with the constant term taken in $\mathbb{F}_{p^6}$ via $u^6 = 7$.
+
+**Group and prime-order subgroup.** The $\mathbb{F}_{p^6}$-rational points of $E$,
+together with the point at infinity $\mathcal{O}$, form a finite abelian group
+under the usual chord-and-tangent addition law. Cheetah uses its $255$-bit
+prime-order subgroup of order
+
+$$q = 55610362957290864006699123731285679659474893560816383126640993521607086746831.$$
+
+The generator `A_GEN` ($G$) generates this subgroup, so $q\cdot G = \mathcal{O}$,
+and all scalar arithmetic in this crate is performed modulo $q$ — the constant
+`G_ORDER`. Pollard's rho on a $255$-bit subgroup gives roughly $2^{127}$ generic
+discrete-log security.
+
 ## Security
 
 The whole signing path is **constant time** — the scalar field
