@@ -86,6 +86,47 @@ and all scalar arithmetic in this crate is performed modulo $q$ — the constant
 `G_ORDER`. Pollard's rho on a $255$-bit subgroup gives roughly $2^{127}$ generic
 discrete-log security.
 
+## Sage Verification
+
+Parameters verified via: `sage load("verify.sage")`
+
+```
+===========================================================================
+CHEETAH CURVE VERIFICATION
+Paper: Security Analysis of Elliptic Curves over Sextic Extension
+       of Small Prime Fields (eprint 2022/277), Section 5.1
+===========================================================================
+
+[1] Base prime p = 18446744069414584321  (Goldilocks, 2^64 - 2^32 + 1)
+    Sextic extension F6 = F_p[u]/( x^6 + 18446744069414584314 ) created.
+    (7 confirmed quadratic AND cubic non-residue in F_p)
+
+[2] Curve parameters
+    a = 1
+    b = u + 395   (= u + 395)
+    Generator g constructed on the curve.
+    Subgroup order n = 0x7af2599b3b3f22d0563fbf0f990a37b5327aa72330157722d443623eaed4accf  (255-bit)
+    Cofactor h = 708537115134665106932687062569690615370  (130-bit)
+
+--------------------------------------------------
+CORE CHECKS
+--------------------------------------------------
+[OK] Generator lies on the curve
+[OK] Subgroup order n is prime
+[OK] Generator has exact order n  (n*G = O, G != O, n prime)
+[OK] Full order #E = h*n verified (384-bit, unique in Hasse interval)
+===========================================================================
+VERIFICATION SUMMARY  (all constants match eprint 2022/277 Sec 5.1)
+===========================================================================
+
+  [OK] p, F_{p^6} = F_p[u]/(u^6 - 7)
+  [OK] E : y^2 = x^3 + x + (u + 395),  a = 1
+  [OK] generator g matches paper / Rust A_GEN
+  [OK] generator has exact prime order n  (= Rust G_ORDER)
+  [OK] cofactor h and full order #E = h*n verified within Hasse bound
+
+```
+
 ## Security
 
 The whole signing path is **constant time** — the scalar field
