@@ -1,7 +1,8 @@
 #![allow(clippy::len_without_is_empty)]
 
-use std::fmt::LowerHex;
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use alloc::vec::Vec;
+use core::fmt::LowerHex;
+use core::ops::{Add, Div, Mul, Neg, Sub};
 
 use num_traits::Pow;
 use serde::de::Error as SerdeError;
@@ -29,7 +30,7 @@ pub const ORDER: u64 = 2_u64.pow(32);
 pub struct Belt(pub u64);
 
 impl LowerHex for Belt {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:x}", self.0)
     }
 }

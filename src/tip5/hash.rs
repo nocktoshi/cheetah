@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use super::*;
 use crate::belt::{montify, Belt};
 

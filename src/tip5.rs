@@ -1,6 +1,6 @@
 pub mod hash;
 
-use std::ops::{Add, Mul, Sub};
+use core::ops::{Add, Mul, Sub};
 
 use arrayref::array_ref;
 

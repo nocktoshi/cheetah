@@ -3,6 +3,8 @@
 //! These are the low-level message-encoding primitives shared by the MPC signer,
 //! the FROST ciphersuite, and the on-chain verifier.
 
+use alloc::vec::Vec;
+
 use crypto_bigint::U256;
 
 use crate::belt::{Belt, PRIME};

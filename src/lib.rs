@@ -38,6 +38,10 @@
 //! parity with the on-chain Nockchain verifier and `@nockchain/rose-ts` is
 //! enforced by the in-crate known-answer + golden-vector tests.
 
+#![cfg_attr(not(test), no_std)]
+#[macro_use]
+extern crate alloc;
+
 #[macro_use]
 pub mod belt;
 pub mod cheetah;

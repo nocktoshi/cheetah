@@ -20,6 +20,9 @@
 //! Security note: the entire signing path is constant time.
 //! See `SECURITY.md`.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crypto_bigint::U256;
 use subtle::{Choice, ConstantTimeEq, ConstantTimeLess};
 use zeroize::{Zeroize, ZeroizeOnDrop};
