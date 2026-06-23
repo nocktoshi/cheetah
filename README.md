@@ -27,9 +27,9 @@ accept iff  R' ≠ O  and  trunc_g_order(Tip5(R'.x ‖ R'.y ‖ P.x ‖ P.y ‖ 
 
 Because the verifier is nonce-agnostic, this curve+hash instantiation supports
 threshold / FROST-style Schnorr (any joint nonce verifies), which is what makes
-it usable as a NEAR-MPC signing domain. `no_std`-friendly arithmetic compiles to
-`wasm32-unknown-unknown`, so a NEAR contract can verify Nockchain signatures
-on-chain:
+it usable as a NEAR-MPC signing domain. The library is `#![no_std]` (it uses
+`alloc` for `Vec`/`String`) and compiles to `wasm32-unknown-unknown`, so a NEAR
+contract can verify Nockchain signatures on-chain:
 
 ```rust
 use cheetah_curve::{PublicKey, Signature};

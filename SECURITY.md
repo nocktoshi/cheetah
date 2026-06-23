@@ -76,7 +76,7 @@ analogous to (`k256` Schnorr/ECDSA). Each finding is mapped below.
 | **VVV** (Low) | Hex decoding not constant time | Partial | **Annotated.** `PublicKey::to_hex` / `from_hex` are documented as **not** constant time and used only for public keys; no secret is ever hex-encoded. |
 | **HRB** (Low) | Timing leak in saturating arithmetic | No (dependency-internal) | Inherited fixed in `crypto-bigint` ≥ 0.5.3. |
 | **K2E / QTR / NEW** | crypto-primes prime-gen / overflow / test issues | No | This crate does no prime generation. |
-| **YTT** (Info) | Missing toolchain spec / outdated deps | **Yes** | **Fixed.** `rust-version = "1.85"` is pinned; dependencies are current (`crypto-bigint 0.6`, `subtle 2.6`, `zeroize 1.8`). |
+| **YTT** (Info) | Missing toolchain spec / outdated deps | **Yes** | **Fixed.** `rust-version = "1.96"` is pinned; dependencies are current (`crypto-bigint 0.7.4`, `subtle 2.6`, `zeroize 1.9`, `thiserror 2.0`). |
 
 ---
 
@@ -196,8 +196,17 @@ constant time. The changes, top to bottom:
   scalars must go through `ch_scal_big`.
 - **RCB completeness** depends on the same prime-order-subgroup precondition: the
   formula is exception-free there, so `proj_add` never hits the (homogeneous)
-  point-at-infinity degeneracy. `in_curve` validates subgroup membership, and all
-  internally-produced points are subgroup elements.
+  point-at-infinity degeneracy. It is **not** complete on the full (even-order)
+  group — exhaustive search over a cofactor subgroup shows its exceptional inputs
+  are exactly the operand pairs differing by the rational 2-torsion point, where
+  it returns a bogus identity. `ch_scal_big` is therefore used only on
+  prime-order-subgroup points (every key, nonce, aggregate, and child the library
+  produces), and **subgroup-membership validation (`in_curve`) deliberately uses
+  the *affine* law (`affine_scal_order`), not the RCB ladder**, since the affine
+  `ch_add`/`ch_double` are correct for every on-curve point (points differing by
+  the 2-torsion have distinct x-coordinates, so it is an ordinary addition).
+  `from_be_bytes` / `verify` / `aggregate_pubkeys` / `derive_child` reject the
+  identity, off-curve points, and any point outside the prime-order subgroup.
 - Constant-time selects rely on `subtle`'s optimization barriers; as always,
   "constant time in source" is not a guarantee about every backend's machine
   code, but no data-dependent branches or table indices are emitted.
@@ -210,7 +219,7 @@ constant-time path is also the fast path.
 
 ## 6. Verification
 
-- `cargo test` — 24 tests, including:
+- `cargo test` — 34 tests, including:
   - `golden_*` — byte-exact `(c, s)` parity with `@nockchain/rose-ts` (single +
     threshold). These pass unchanged after the crypto-bigint migration, the
     branchless-arithmetic rewrite, **and** the projective scalar-mul rewrite —
@@ -226,7 +235,17 @@ constant-time path is also the fast path.
   - `verify_rejects_identity_rprime` (CRR), `private_key_rejects_out_of_range`
     (FQT), `verify_rejects_tampering`,
     `derive_child_signature_verifies_under_child_key`,
-    `additive_threshold_two_party_verifies`, message-codec round-trips.
+    `additive_threshold_two_party_verifies`, message-codec round-trips;
+  - point-validation hardening: `in_curve_rejects_off_curve_point`,
+    `in_curve_rejects_low_order_point`, `low_order_points_are_on_curve_but_rejected`
+    (hash-to-curve cofactor points of orders 5/29/181/10/58),
+    `rcb_ladder_is_unsound_on_even_order_points` (the regression guard that pins
+    why membership uses the affine law), `verify_rejects_low_order_pubkey`,
+    `verify_rejects_non_canonical_message`, `sign_rejects_non_canonical_message`,
+    `aggregate_and_derive_reject_identity`.
+- `cargo build` — the library is `#![cfg_attr(not(test), no_std)]` (uses `alloc`
+  for `Vec`/`String`); a non-test build therefore compiles without `std` and
+  rejects any accidental `std::` use in library code.
 - `cargo build --target wasm32-unknown-unknown` — the verifier compiles for the
   on-chain (NEAR contract) target.
 - `cargo clippy` — clean.
