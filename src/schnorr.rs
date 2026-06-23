@@ -24,7 +24,7 @@ use crypto_bigint::U256;
 use subtle::{Choice, ConstantTimeEq, ConstantTimeLess};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::belt::Belt;
+use crate::belt::{Belt, PRIME};
 use crate::cheetah::{
     ch_add, ch_neg, ch_scal_big, trunc_g_order, CheetahError, CheetahPoint, A_GEN, A_ID, G_ORDER,
     G_ORDER_NZ,
@@ -35,6 +35,12 @@ use crate::tip5::hash::hash_varlen;
 /// - the valid range for a private key, challenge, or response scalar.
 fn is_canonical_scalar(x: &U256) -> Choice {
     !x.ct_eq(&U256::ZERO) & x.ct_lt(&G_ORDER)
+}
+
+/// Whether every limb of a 5-belt message digest is a canonical Goldilocks field
+/// element (`< PRIME`).
+fn message_is_canonical(message: &[u64; 5]) -> bool {
+    message.iter().all(|&u| u < PRIME)
 }
 
 fn reduce(x: &U256) -> U256 {
@@ -188,6 +194,9 @@ impl PrivateKey {
     /// Single-signer sign with the deterministic nonce. Byte-identical to
     /// `@nockchain/rose-ts`'s `signDigest`.
     pub fn sign(&self, message: &[u64; 5]) -> Result<Signature, CheetahError> {
+        if !message_is_canonical(message) {
+            return Err(CheetahError::NonCanonicalMessage);
+        }
         let pubkey = ch_scal_big(&self.0, &A_GEN)?;
         let nonce = self.nonce_for(&pubkey, message);
         let r = ch_scal_big(&nonce, &A_GEN)?;
@@ -223,6 +232,7 @@ pub fn challenge(r: &CheetahPoint, pubkey: &CheetahPoint, message: &[u64; 5]) ->
 /// `verifySignature`, with the additional non-malleability check below.
 ///
 /// Rejects:
+/// - non-canonical message limbs
 /// - out-of-range scalars (`c` or `s` not in `[1, G_ORDER)`),
 /// - the point at infinity as a public key,
 /// - **`R' = s·G − c·P` equal to the identity** — without this an attacker who
@@ -232,10 +242,16 @@ pub fn challenge(r: &CheetahPoint, pubkey: &CheetahPoint, message: &[u64; 5]) ->
 ///   produce `R' = O`,
 /// - any curve-arithmetic failure.
 pub fn verify(pubkey: &CheetahPoint, sig: &Signature, message: &[u64; 5]) -> bool {
+    // The message is public, so this need not be constant time (M-3).
+    if !message_is_canonical(message) {
+        return false;
+    }
     if !bool::from(is_canonical_scalar(&sig.c) & is_canonical_scalar(&sig.s)) {
         return false;
     }
-    if pubkey.inf {
+    // Reject the identity, off-curve points, and any point outside the
+    // prime-order subgroup (M-1).
+    if pubkey.inf || !pubkey.in_curve() {
         return false;
     }
     // R' = s·G − c·P
@@ -277,6 +293,10 @@ pub fn tweak_from_le_bytes(bytes: &[u8]) -> U256 {
 /// application, so the key the contract derives equals the key the signer
 /// produces signatures for.
 pub fn derive_child(root: &CheetahPoint, tweak: &U256) -> Result<CheetahPoint, CheetahError> {
+    // Reject the identity (a degenerate root with no secret) and any off-curve
+    if root.inf || !root.in_curve() {
+        return Err(CheetahError::NotOnCurve);
+    }
     let tg = ch_scal_big(&reduce(tweak), &A_GEN)?;
     ch_add(root, &tg)
 }
@@ -285,6 +305,10 @@ pub fn derive_child(root: &CheetahPoint, tweak: &U256) -> Result<CheetahPoint, C
 pub fn aggregate_pubkeys(shares: &[CheetahPoint]) -> Result<CheetahPoint, CheetahError> {
     let mut acc = A_ID;
     for p in shares {
+        // Reject the identity (a share with no key) and any off-curve
+        if p.inf || !p.in_curve() {
+            return Err(CheetahError::NotOnCurve);
+        }
         acc = ch_add(&acc, p)?;
     }
     Ok(acc)
@@ -388,6 +412,91 @@ mod test {
             !pk.verify(&forged, &m),
             "identity R' signature must be rejected"
         );
+    }
+
+    #[test]
+    fn verify_rejects_off_curve_pubkey() {
+        // a public key that never went through the validating
+        // `from_be_bytes` decoder (here built by bit-flipping a real key off the
+        // curve) must be rejected by `verify` itself.
+        let sk = sk();
+        let pk = sk.public_key().unwrap();
+        let m = [1u64, 2, 3, 4, 5];
+        let sig = sk.sign(&m).unwrap();
+        assert!(pk.verify(&sig, &m), "sanity: the honest key verifies");
+
+        let mut off = pk.0;
+        off.y.0[0] = Belt(off.y.0[0].0 ^ 1);
+        assert!(!verify(&off, &sig, &m), "off-curve public key is rejected");
+    }
+
+    #[test]
+    fn verify_rejects_low_order_pubkey() {
+        // an on-curve point of small order (the 2-torsion point) is
+        // outside the prime-order subgroup and must be rejected as a public key.
+        use crate::cheetah::{CheetahPoint, F6lt};
+        let sk = sk();
+        let m = [1u64, 2, 3, 4, 5];
+        let sig = sk.sign(&m).unwrap();
+        let two_torsion = CheetahPoint {
+            x: F6lt([
+                Belt(16464216994076148022),
+                Belt(10762729315666779701),
+                Belt(13396543320389503071),
+                Belt(6901070379872838024),
+                Belt(3684827223278792538),
+                Belt(13601246634833184273),
+            ]),
+            y: crate::cheetah::F6_ZERO,
+            inf: false,
+        };
+        assert!(
+            !verify(&two_torsion, &sig, &m),
+            "low-order public key is rejected"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_non_canonical_message() {
+        // a message limb >= PRIME is non-canonical and must be
+        // rejected, not silently processed (release) or panicked on (debug).
+        let sk = sk();
+        let pk = sk.public_key().unwrap();
+        let m = [1u64, 2, 3, 4, 5];
+        let sig = sk.sign(&m).unwrap();
+        let bad_m = [PRIME, 2, 3, 4, 5];
+        assert!(
+            !pk.verify(&sig, &bad_m),
+            "non-canonical message is rejected"
+        );
+    }
+
+    #[test]
+    fn sign_rejects_non_canonical_message() {
+        let sk = sk();
+        let bad_m = [1u64, PRIME, 3, 4, 5];
+        assert!(
+            matches!(sk.sign(&bad_m), Err(CheetahError::NonCanonicalMessage)),
+            "signing a non-canonical message returns an error"
+        );
+    }
+
+    #[test]
+    fn aggregate_and_derive_reject_identity() {
+        // A share / root of the identity (no underlying key) must be rejected even
+        // though it is a valid group element that `in_curve` accepts.
+        let g = sk().public_key().unwrap().0;
+        assert!(matches!(
+            aggregate_pubkeys(&[g, A_ID]),
+            Err(CheetahError::NotOnCurve)
+        ));
+        assert!(matches!(
+            derive_child(&A_ID, &U256::from_u64(5)),
+            Err(CheetahError::NotOnCurve)
+        ));
+        // A genuine share / root still works.
+        assert!(aggregate_pubkeys(&[g, g]).is_ok());
+        assert!(derive_child(&g, &U256::from_u64(5)).is_ok());
     }
 
     #[test]

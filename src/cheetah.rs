@@ -66,6 +66,9 @@ pub enum CheetahError {
 
     #[error("field element is not invertible")]
     NotInvertible,
+
+    #[error("message limb is not a canonical field element (>= PRIME)")]
+    NonCanonicalMessage,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -146,12 +149,28 @@ impl CheetahPoint {
         Self::from_be_bytes(&v)
     }
 
+    /// Whether `(x, y)` satisfies the curve equation `y² = x³ + x + b`
+    /// (`a = 1`, `b = u + 395`). Cheap (no scalar multiplication) and branch-free.
+    /// This is the *definitive* on-curve test; [`Self::in_curve`]
+    fn satisfies_curve_eq(&self) -> Choice {
+        let lhs = f6_square(&self.y);
+        let x2 = f6_square(&self.x);
+        let x3 = f6_mul(&x2, &self.x);
+        let rhs = f6_add(&f6_add(&x3, &self.x), &B);
+        f6_ct_eq(&lhs, &rhs)
+    }
+
+    /// Full point validation: the point is the identity, or it lies on the curve
+    /// **and** generates the prime-order subgroup `G`.
     pub fn in_curve(&self) -> bool {
-        if *self == A_ID {
+        if self.inf {
             return true;
         }
-        let scaled = ch_scal_big(&G_ORDER, self).expect("scalar multiplication should succeed");
-        scaled == A_ID
+        if !bool::from(self.satisfies_curve_eq()) {
+            return false;
+        }
+        // Subgroup membership: [n]P == O via the fast constant-time RCB ladder.
+        ch_scal_big(&G_ORDER, self).expect("scalar multiplication is infallible") == A_ID
     }
 }
 
@@ -422,6 +441,9 @@ pub fn ch_scal(n: u64, p: &CheetahPoint) -> Result<CheetahPoint, CheetahError> {
 // prime-order subgroup, so only one inversion is needed at the very end to return
 // to affine.
 
+/// `b` for the Cheetah curve `y² = x³ + x + b` (`a = 1`, `b = u + 395`).
+const B: F6lt = F6lt([Belt(395), Belt(1), Belt(0), Belt(0), Belt(0), Belt(0)]);
+
 /// `b3 = 3·b` for the Cheetah curve `y² = x³ + x + b` (`a = 1`), as an `F6`
 /// element — the only curve-specific constant the RCB formula needs.
 const B3: F6lt = F6lt([Belt(1185), Belt(3), Belt(0), Belt(0), Belt(0), Belt(0)]);
@@ -479,9 +501,6 @@ impl ConditionallySelectable for ProjPoint {
 /// for points in the prime-order subgroup, and unified — it also yields `2P`
 /// when `P = Q` and handles the identity, so the scalar-mul loop needs no special
 /// cases.
-//
-// Not `inline(always)`: it is called 512× per scalar multiplication, and forcing
-// it inline blows up the (debug) stack frame.
 fn proj_add(p: &ProjPoint, q: &ProjPoint) -> ProjPoint {
     let (x1, y1, z1) = (p.x, p.y, p.z);
     let (x2, y2, z2) = (q.x, q.y, q.z);
@@ -527,11 +546,20 @@ fn proj_add(p: &ProjPoint, q: &ProjPoint) -> ProjPoint {
     z3 = f6_mul(&t5, &z3);
     z3 = f6_add(&z3, &t0);
 
-    ProjPoint {
+    let sum = ProjPoint {
         x: x3,
         y: y3,
         z: z3,
-    }
+    };
+
+    // Completeness fix. RCB Algorithm 1 is complete only on the prime-order
+    // subgroup. On the full group `O + Q` evaluates to `Q` scaled by `Q.y`, so for
+    // the rational 2-torsion point `T` (`y = 0`) it collapses to the zero vector
+    // `(0:0:0)`
+    let p_is_identity = f6_ct_eq(&p.z, &F6_ZERO);
+    let q_is_identity = f6_ct_eq(&q.z, &F6_ZERO);
+    let sum = ProjPoint::conditional_select(&sum, q, p_is_identity);
+    ProjPoint::conditional_select(&sum, p, q_is_identity)
 }
 
 /// Scalar multiplication `n·p`, constant time.
@@ -729,8 +757,6 @@ mod test {
 
     #[test]
     fn ch_add_edge_cases() -> Result<(), CheetahError> {
-        // The constant-time unified `ch_add`/`ch_double` must still handle every
-        // special case the old branchy version did.
         let g = A_GEN;
         let two_g = ch_double(g)?;
         let three_g = ch_scal(3, &g)?;
@@ -779,5 +805,109 @@ mod test {
         let parts = ch_add(&ch_scal_big(&a, &A_GEN)?, &ch_scal_big(&b, &A_GEN)?)?;
         assert_eq!(sum, parts, "(a+b)·G == a·G + b·G");
         Ok(())
+    }
+
+    #[test]
+    fn in_curve_accepts_generator_and_identity() {
+        assert!(
+            A_GEN.in_curve(),
+            "the generator is in the prime-order subgroup"
+        );
+        assert!(A_ID.in_curve(), "the identity is accepted");
+    }
+
+    #[test]
+    fn in_curve_rejects_off_curve_point() {
+        let mut bad = A_GEN;
+        bad.y.0[0] = Belt(bad.y.0[0].0 ^ 1);
+        assert!(
+            !bool::from(bad.satisfies_curve_eq()),
+            "tampered point is off-curve"
+        );
+        assert!(!bad.in_curve(), "in_curve rejects an off-curve point");
+    }
+
+    fn two_torsion_point() -> CheetahPoint {
+        CheetahPoint {
+            x: F6lt([
+                Belt(16464216994076148022),
+                Belt(10762729315666779701),
+                Belt(13396543320389503071),
+                Belt(6901070379872838024),
+                Belt(3684827223278792538),
+                Belt(13601246634833184273),
+            ]),
+            y: F6_ZERO,
+            inf: false,
+        }
+    }
+
+    #[test]
+    fn in_curve_rejects_low_order_point() {
+        // The curve's lone non-trivial rational 2-torsion point (paper §5.2):
+        // it IS on the curve, but has order 2, so it lies in the cofactor part,
+        // not the prime-order subgroup `G`. The equation check passes; the
+        // `[n]P == O` subgroup check must reject it (n is odd ⇒ [n]·T = T ≠ O).
+        assert!(
+            bool::from(two_torsion_point().satisfies_curve_eq()),
+            "the 2-torsion point is genuinely on the curve"
+        );
+        assert!(
+            !two_torsion_point().in_curve(),
+            "in_curve rejects an on-curve point outside the prime-order subgroup"
+        );
+    }
+
+    #[test]
+    fn proj_add_completeness_fix_2torsion() {
+        // The unpatched RCB ladder computed [3]T = O for the order-2 point T; with
+        // the identity-operand overrides in `proj_add` it must now give the true
+        // values: [2]T = O, [3]T = T, and [n]T = T (≠ O).
+        let t = two_torsion_point();
+        assert_eq!(
+            ch_scal_big(&U256::from_u64(2), &t).unwrap(),
+            A_ID,
+            "[2]T = O"
+        );
+        assert_eq!(
+            ch_scal_big(&U256::from_u64(3), &t).unwrap(),
+            t,
+            "[3]T = T (was O)"
+        );
+        let nt = ch_scal_big(&G_ORDER, &t).unwrap();
+        assert_eq!(nt, t, "[n]T = T");
+        assert_ne!(nt, A_ID, "[n]T != O");
+    }
+
+    fn affine_scal_order(p: &CheetahPoint) -> CheetahPoint {
+        let be: [u8; 32] = G_ORDER.to_be_bytes().into();
+        let mut acc = A_ID;
+        for byte in be {
+            for bit in (0..8).rev() {
+                acc = ch_double(acc).expect("ch_double is infallible");
+                if (byte >> bit) & 1 == 1 {
+                    acc = ch_add(&acc, p).expect("ch_add is infallible");
+                }
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn fast_ladder_matches_affine_reference_on_cofactor_points() {
+        // The fast constant-time ladder (`ch_scal_big`) must agree with the affine
+        // reference (`affine_scal_order`) on points OUTSIDE the prime-order
+        // subgroup — exactly where the unpatched ladder was wrong. Covers the
+        // order-2 point T and the order-2n point G+T (which passes through the
+        // 2-torsion when multiplied by n).
+        let t = two_torsion_point();
+        let g_plus_t = ch_add(&A_GEN, &t).unwrap();
+        for p in [A_GEN, t, g_plus_t] {
+            assert_eq!(
+                ch_scal_big(&G_ORDER, &p).unwrap(),
+                affine_scal_order(&p),
+                "fast ladder must match the affine reference on cofactor points"
+            );
+        }
     }
 }
